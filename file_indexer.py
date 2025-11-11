@@ -113,8 +113,14 @@ def process_directory_files(task_tuple):
         # Filter for files only, skipping directories
         for entry in os.scandir(directory_path_str):
             if entry.is_file():
+                # --- THIS IS THE ENCODING FIX ---
+                # Sanitize the filename to replace invalid surrogates (e.g., from NTFS)
+                # with a '?' before sending to the UTF-8 database.
+                cleaned_name = entry.name.encode('utf-8', 'replace').decode('utf-8')
+
                 # Append a dictionary, which is picklable and safe for multiprocessing
-                files_to_add.append({'folder_id': folder_id, 'name': entry.name})
+                files_to_add.append({'folder_id': folder_id, 'name': cleaned_name})
+                # --- END OF FIX ---
 
         return files_to_add
 
@@ -127,96 +133,129 @@ def process_directory_files(task_tuple):
 
 # --- Main Logic ---
 
-def main(drive_letter):
+# --- Main Logic ---
+
+def main(drive_letter, skip_folders=False):
     database_url = f'sqlite:///{DATABASE_NAME}'
     Session, engine = setup_db(database_url)
 
     print(f"Database setup complete: {DATABASE_NAME}")
 
-    # Phase 1: Collect all directories (Single-threaded)
-    all_dir_paths = get_drive_paths(drive_letter)
-    if not all_dir_paths:
-        print("No paths found. Exiting.")
-        return
-
-    # Phase 2: Insert all Folders (Single-threaded)
-    print("\nPhase 2: Inserting all folders into the database...")
-    session = Session()
-
     # Dictionary to map full path string to its new primary key ID
     path_to_id = {}
+    phase2_duration = 0.0
 
-    # Sort paths by depth to ensure parents are created before children
-    all_dir_paths.sort(key=lambda p: len(p.parts))
+    session = Session()
 
-    start_time_phase2 = time.time()
-    try:
-        for path in tqdm(all_dir_paths, desc="Indexing Folders"):
-            path_str = str(path)
+    if not skip_folders:
+        # --- Phases 1 & 2: Run as normal ---
+        print("Running Phase 1 & 2: Scanning and Indexing Folders...")
 
-            # Determine parent_id by looking up the parent's path string
-            parent_id = None
-            parent_path_str = str(path.parent)
-            if path.parent and parent_path_str in path_to_id:
-                parent_id = path_to_id[parent_path_str]
+        # Phase 1: Collect all directories (Single-threaded)
+        all_dir_paths = get_drive_paths(drive_letter)
+        if not all_dir_paths:
+            print("No paths found. Exiting.")
+            return
 
-            folder = Folder(
-                name=path.name or str(path),  # Use path if name is empty (like C:\)
-                path=path_str,
-                parent_id=parent_id
+        # Phase 2: Insert all Folders (Single-threaded)
+        print("\nPhase 2: Inserting all folders into the database...")
+
+        # Sort paths by depth to ensure parents are created before children
+        all_dir_paths.sort(key=lambda p: len(p.parts))
+
+        start_time_phase2 = time.time()
+        try:
+            for path in tqdm(all_dir_paths, desc="Indexing Folders"):
+                path_str = str(path)
+
+                # Determine parent_id by looking up the parent's path string
+                parent_id = None
+                parent_path_str = str(path.parent)
+                if path.parent and parent_path_str in path_to_id:
+                    parent_id = path_to_id[parent_path_str]
+
+                folder = Folder(
+                    name=path.name or str(path),  # Use path if name is empty (like C:\)
+                    path=path_str,
+                    parent_id=parent_id
+                )
+                session.add(folder)
+                session.flush()  # Flush to get ID
+                path_to_id[path_str] = folder.id  # Store ID for child-lookups
+
+            session.commit()
+            end_time_phase2 = time.time()
+            phase2_duration = end_time_phase2 - start_time_phase2
+            print(f"Successfully indexed {len(path_to_id)} folders in {phase2_duration:.2f}s.")
+
+        except IntegrityError:
+            session.rollback()
+            print("Error: Integrity constraint failed (e.g., duplicate paths).")
+            print("This usually means the database was not empty. Please delete the database file and try again.")
+            session.close()
+            return
+        except Exception as e:
+            session.rollback()
+            print(f"An unexpected error occurred during folder indexing: {e}")
+            session.close()
+            return
+        finally:
+            session.close()
+
+    else:
+        # --- Skip Phases 1 & 2: Load from DB ---
+        print("\n--skip-folders flag detected. Skipping folder indexing.")
+        print("Loading existing folder data from database...")
+        start_time_phase2_load = time.time()
+        session = Session()
+        try:
+            # Filter folders for the specified drive
+            drive_root = f"{drive_letter}:\\"
+            print(f"Querying for folders starting with {drive_root} ...")
+
+            # Query for path and ID, filtering by the selected drive
+            folder_query = session.query(Folder.path, Folder.id).filter(
+                Folder.path.startswith(drive_root)
             )
-            session.add(folder)
 
-            # Flush session to get the new folder.id *before* committing
-            # This makes the ID available for subsequent child folders
-            session.flush()
+            # Use tqdm to show progress of loading from DB
+            for path, folder_id in tqdm(folder_query, desc="Loading Folders"):
+                path_to_id[path] = folder_id
 
-            # Store the generated ID for child-lookups
-            path_to_id[path_str] = folder.id
+            end_time_phase2_load = time.time()
+            phase2_duration = end_time_phase2_load - start_time_phase2_load
 
-        # Commit all folders in one transaction at the end
-        session.commit()
+            if not path_to_id:
+                print(f"Error: No folders found in database for drive {drive_letter}.")
+                print("Please run the script once without --skip-folders to index the drive.")
+                session.close()
+                return
 
-        end_time_phase2 = time.time()
-        print(f"Successfully indexed {len(path_to_id)} folders in {end_time_phase2 - start_time_phase2:.2f}s.")
+            print(f"Loaded {len(path_to_id)} folders from DB in {phase2_duration:.2f}s.")
 
-    except IntegrityError:
-        session.rollback()
-        print("Error: Integrity constraint failed (e.g., duplicate paths).")
-        print("This usually means the database was not empty. Please delete the database file and try again.")
-        session.close()
-        return
-    except Exception as e:
-        session.rollback()
-        print(f"An unexpected error occurred during folder indexing: {e}")
-        session.close()
-        return
-    finally:
-        session.close()
+        except Exception as e:
+            print(f"Error loading folders from database: {e}")
+            session.close()
+            return
+        finally:
+            session.close()
 
-    # Phase 3: Find all Files (Parallel Scan)
+    # --- Phase 3: Find all Files (Parallel Scan) ---
     print(f"\nPhase 3: Starting parallel file scanning using {cpu_count()} cores...")
 
     # Create a list of (path, folder_id) tuples to send to the workers
-    # This avoids the worker needing to do any DB lookups
     tasks = [(path, folder_id) for path, folder_id in path_to_id.items()]
 
     all_files_to_insert = []
     start_time_phase3 = time.time()
 
     try:
-        # Use multiprocessing Pool to execute the file scanning in parallel
-        # No initializer is needed as workers are stateless
         with Pool(processes=cpu_count()) as pool:
-
-            # Use tqdm to wrap the pool.imap for real-time progress bar
-            # pool.imap is memory-efficient for large numbers of tasks
             for file_list_chunk in tqdm(
                     pool.imap(process_directory_files, tasks),
                     total=len(tasks),
                     desc="Scanning Files (Parallel)"
             ):
-                # file_list_chunk is the list of dicts returned by the worker
                 all_files_to_insert.extend(file_list_chunk)
 
     except Exception as e:
@@ -224,15 +263,15 @@ def main(drive_letter):
 
     end_time_phase3 = time.time()
     total_files_found = len(all_files_to_insert)
-    print(f"Found {total_files_found} files in {end_time_phase3 - start_time_phase3:.2f}s.")
+    phase3_duration = end_time_phase3 - start_time_phase3
+    print(f"Found {total_files_found} files in {phase3_duration:.2f}s.")
 
-    # Phase 4: Insert all Files (Single-threaded Bulk Insert)
+    # --- Phase 4: Insert all Files (Single-threaded Bulk Insert) ---
     print(f"\nPhase 4: Inserting {total_files_found} files into the database...")
     start_time_phase4 = time.time()
     session = Session()
     try:
         # Use bulk_insert_mappings for the list of dictionaries
-        # This is the fastest way to insert many rows
         session.bulk_insert_mappings(File, all_files_to_insert)
         session.commit()
     except Exception as e:
@@ -242,21 +281,25 @@ def main(drive_letter):
         session.close()
 
     end_time_phase4 = time.time()
-    print(f"Database insertion complete in {end_time_phase4 - start_time_phase4:.2f}s.")
+    phase4_duration = end_time_phase4 - start_time_phase4
+    print(f"Database insertion complete in {phase4_duration:.2f}s.")
 
     # --- Summary ---
-    total_time = (end_time_phase2 - start_time_phase2) + (end_time_phase3 - start_time_phase3) + (
-                end_time_phase4 - start_time_phase4)
+    total_time = phase2_duration + phase3_duration + phase4_duration
     print("\n--- Indexing Complete ---")
     print(f"Total time taken: {total_time:.2f} seconds")
     print(f"Total folders indexed: {len(path_to_id)}")
     print(f"Total files indexed: {total_files_found}")
     print(f"Database file: {DATABASE_NAME}")
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Parallel File System Indexer using SQLAlchemy.")
     parser.add_argument('drive', type=str, help='The drive letter to scan (e.g., C, D, E).')
+    parser.add_argument(
+        '--skip-folders',
+        action='store_true',
+        help='Skip folder indexing (Phases 1 & 2) and use existing folder data from the DB.'
+    )
 
     args = parser.parse_args()
 
@@ -274,4 +317,5 @@ if __name__ == '__main__':
         print("Error: Please provide a single drive letter (e.g., C).")
         sys.exit(1)
 
-    main(args.drive.upper())
+    # Pass the new flag to main
+    main(args.drive.upper(), args.skip_folders)
