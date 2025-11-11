@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# project files
+*.db
+*.db-journal

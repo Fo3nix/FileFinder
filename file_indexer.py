@@ -8,13 +8,13 @@ from pathlib import Path
 # Third-party dependencies
 # pip install sqlalchemy tqdm
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Index
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from sqlalchemy.exc import IntegrityError
 from tqdm import tqdm
 
 # --- Configuration ---
 DATABASE_NAME = 'filesystem_index.db'
+# Use modern SQLAlchemy 2.0 syntax for Base
 Base = declarative_base()
 
 
@@ -32,7 +32,7 @@ class Folder(Base):
     parent = relationship("Folder", remote_side=[id])
     files = relationship("File", back_populates="folder")
 
-    # Index on the name for search speed (as requested)
+    # Index on the name for search speed
     __table_args__ = (
         Index('idx_folder_name', 'name'),
     )
@@ -45,13 +45,14 @@ class File(Base):
     """Represents a file in the filesystem."""
     __tablename__ = 'files'
     id = Column(Integer, primary_key=True)
-    folder_id = Column(Integer, ForeignKey('folders.id'), nullable=True)
+    # A file must belong to a folder, so nullable=False
+    folder_id = Column(Integer, ForeignKey('folders.id'), nullable=False)
     name = Column(String, nullable=False)
 
     # Relationships
     folder = relationship("Folder", back_populates="files")
 
-    # Index on the name for search speed (as requested)
+    # Index on the name for search speed
     __table_args__ = (
         Index('idx_file_name', 'name'),
     )
@@ -63,7 +64,7 @@ class File(Base):
 # --- Database and Setup Functions ---
 
 def setup_db(database_url):
-    """Initializes the database and returns the Session and Engine."""
+    """Initializes the database and returns the Session factory and Engine."""
     engine = create_engine(database_url)
     # Create tables if they don't exist
     Base.metadata.create_all(engine)
@@ -86,6 +87,7 @@ def get_drive_paths(drive_letter):
     # Use os.walk for robust and fast directory traversal
     folder_paths = []
 
+    # onerror=lambda e: None will skip directories the user can't access
     for root, dirs, files in os.walk(drive_path, onerror=lambda e: None):
         # Add the current root directory
         folder_paths.append(Path(root))
@@ -97,52 +99,30 @@ def get_drive_paths(drive_letter):
 
 # --- Parallel Worker Function ---
 
-def process_directory_files(directory_path_str):
+def process_directory_files(task_tuple):
     """
     Worker function run in parallel: finds files in a single directory
-    and saves them to the database.
+    and returns a list of dictionaries.
+    This function does NOT interact with the database.
     """
-    # Create a new session for this thread/process
-    Session = process_directory_files.Session
-    session = Session()
+    directory_path_str, folder_id = task_tuple
+    files_to_add = []
 
     try:
-        directory_path = Path(directory_path_str)
-
-        # 1. Look up the folder_id using the unique path field
-        folder = session.query(Folder).filter_by(path=directory_path_str).one_or_none()
-
-        if not folder:
-            # Should not happen if Phase 2 runs correctly, but good for safety
-            return 0
-
-        folder_id = folder.id
-
-        # 2. Find all files in the directory (non-recursive)
-        files_to_add = []
-
         # os.scandir is generally faster than Path.iterdir() for raw speed
         # Filter for files only, skipping directories
-        for entry in os.scandir(directory_path):
+        for entry in os.scandir(directory_path_str):
             if entry.is_file():
-                files_to_add.append(File(folder_id=folder_id, name=entry.name))
+                # Append a dictionary, which is picklable and safe for multiprocessing
+                files_to_add.append({'folder_id': folder_id, 'name': entry.name})
 
-        # 3. Bulk insert the files
-        if files_to_add:
-            session.bulk_save_objects(files_to_add)
-            session.commit()
-            return len(files_to_add)
-
-        return 0
+        return files_to_add
 
     except Exception as e:
-        session.rollback()
-        # Optionally log the error, but suppress file system access errors (which are common)
+        # Optionally log the error, but suppress file system access errors
+        # which are common (e.g., permissions denied)
         # print(f"Error processing {directory_path_str}: {e}", file=sys.stderr)
-        return 0
-
-    finally:
-        session.close()
+        return []
 
 
 # --- Main Logic ---
@@ -163,18 +143,22 @@ def main(drive_letter):
     print("\nPhase 2: Inserting all folders into the database...")
     session = Session()
 
-    path_to_id = {}  # Dictionary to map full path to primary key ID
+    # Dictionary to map full path string to its new primary key ID
+    path_to_id = {}
 
-    # Sort paths to help determine parent/child relationships (A:\ vs A:\Foo)
+    # Sort paths by depth to ensure parents are created before children
     all_dir_paths.sort(key=lambda p: len(p.parts))
 
+    start_time_phase2 = time.time()
     try:
         for path in tqdm(all_dir_paths, desc="Indexing Folders"):
             path_str = str(path)
-            # Determine parent_id
+
+            # Determine parent_id by looking up the parent's path string
             parent_id = None
-            if path.parent and str(path.parent) in path_to_id:
-                parent_id = path_to_id[str(path.parent)]
+            parent_path_str = str(path.parent)
+            if path.parent and parent_path_str in path_to_id:
+                parent_id = path_to_id[parent_path_str]
 
             folder = Folder(
                 name=path.name or str(path),  # Use path if name is empty (like C:\)
@@ -182,18 +166,24 @@ def main(drive_letter):
                 parent_id=parent_id
             )
             session.add(folder)
-            session.flush()  # Forces the ID generation before commit
 
-            # Store the generated ID
+            # Flush session to get the new folder.id *before* committing
+            # This makes the ID available for subsequent child folders
+            session.flush()
+
+            # Store the generated ID for child-lookups
             path_to_id[path_str] = folder.id
 
+        # Commit all folders in one transaction at the end
         session.commit()
-        print(f"Successfully indexed {len(path_to_id)} folders.")
+
+        end_time_phase2 = time.time()
+        print(f"Successfully indexed {len(path_to_id)} folders in {end_time_phase2 - start_time_phase2:.2f}s.")
 
     except IntegrityError:
         session.rollback()
         print("Error: Integrity constraint failed (e.g., duplicate paths).")
-        print("This usually means the database was not empty. Please delete the database file or use a clean one.")
+        print("This usually means the database was not empty. Please delete the database file and try again.")
         session.close()
         return
     except Exception as e:
@@ -204,40 +194,63 @@ def main(drive_letter):
     finally:
         session.close()
 
-    # Phase 3: Find and insert all Files (Parallel)
-    print(f"\nPhase 3: Starting parallel file indexing using {cpu_count()} cores...")
+    # Phase 3: Find all Files (Parallel Scan)
+    print(f"\nPhase 3: Starting parallel file scanning using {cpu_count()} cores...")
 
-    # Pass the Session factory object to the worker initialization
-    def init_worker(Session):
-        process_directory_files.Session = Session
+    # Create a list of (path, folder_id) tuples to send to the workers
+    # This avoids the worker needing to do any DB lookups
+    tasks = [(path, folder_id) for path, folder_id in path_to_id.items()]
 
-    # Convert paths to strings for clean passing to the worker pool
-    directory_path_strings = [str(p) for p in all_dir_paths]
-
-    total_files_indexed = 0
-    start_time = time.time()
+    all_files_to_insert = []
+    start_time_phase3 = time.time()
 
     try:
         # Use multiprocessing Pool to execute the file scanning in parallel
-        with Pool(processes=cpu_count(), initializer=init_worker, initargs=(Session,)) as pool:
+        # No initializer is needed as workers are stateless
+        with Pool(processes=cpu_count()) as pool:
 
             # Use tqdm to wrap the pool.imap for real-time progress bar
-            for files_count in tqdm(
-                    pool.imap(process_directory_files, directory_path_strings),
-                    total=len(directory_path_strings),
-                    desc="Indexing Files (Parallel)"
+            # pool.imap is memory-efficient for large numbers of tasks
+            for file_list_chunk in tqdm(
+                    pool.imap(process_directory_files, tasks),
+                    total=len(tasks),
+                    desc="Scanning Files (Parallel)"
             ):
-                total_files_indexed += files_count
+                # file_list_chunk is the list of dicts returned by the worker
+                all_files_to_insert.extend(file_list_chunk)
 
     except Exception as e:
         print(f"\nAn error occurred during parallel processing: {e}")
 
-    end_time = time.time()
+    end_time_phase3 = time.time()
+    total_files_found = len(all_files_to_insert)
+    print(f"Found {total_files_found} files in {end_time_phase3 - start_time_phase3:.2f}s.")
 
+    # Phase 4: Insert all Files (Single-threaded Bulk Insert)
+    print(f"\nPhase 4: Inserting {total_files_found} files into the database...")
+    start_time_phase4 = time.time()
+    session = Session()
+    try:
+        # Use bulk_insert_mappings for the list of dictionaries
+        # This is the fastest way to insert many rows
+        session.bulk_insert_mappings(File, all_files_to_insert)
+        session.commit()
+    except Exception as e:
+        print(f"Error during bulk file insert: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+    end_time_phase4 = time.time()
+    print(f"Database insertion complete in {end_time_phase4 - start_time_phase4:.2f}s.")
+
+    # --- Summary ---
+    total_time = (end_time_phase2 - start_time_phase2) + (end_time_phase3 - start_time_phase3) + (
+                end_time_phase4 - start_time_phase4)
     print("\n--- Indexing Complete ---")
-    print(f"Total time taken: {end_time - start_time:.2f} seconds")
+    print(f"Total time taken: {total_time:.2f} seconds")
     print(f"Total folders indexed: {len(path_to_id)}")
-    print(f"Total files indexed: {total_files_indexed}")
+    print(f"Total files indexed: {total_files_found}")
     print(f"Database file: {DATABASE_NAME}")
 
 
@@ -247,12 +260,13 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # Check if the required library is installed
+    # Check if the required libraries are installed
     try:
         from sqlalchemy import create_engine
+        from tqdm import tqdm
     except ImportError:
-        print("Error: SQLAlchemy is not installed.")
-        print("Please install it using: pip install sqlalchemy tqdm")
+        print("Error: Required libraries (SQLAlchemy, tqdm) are not installed.")
+        print("Please install them using: pip install sqlalchemy tqdm")
         sys.exit(1)
 
     # Ensure the drive letter is a single character
